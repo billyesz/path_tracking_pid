@@ -702,19 +702,19 @@ Controller::UpdateResult Controller::update(
   return result;
 }
 
+// 输入参数：(当前位姿，当前速度，时间间隔)
+
 Controller::UpdateResult Controller::update_with_limits(
   const tf2::Transform & current_tf, const geometry_msgs::Twist & odom_twist, ros::Duration dt)
 {
-  // All limits are absolute
-  double max_x_vel = std::abs(config_.target_x_vel);
-
-  // Apply external limit
-  max_x_vel = std::min(max_x_vel, vel_max_external_);
-
-  // Apply obstacle limit
-  max_x_vel = std::min(max_x_vel, vel_max_obstacle_);
+  // 通过逐级取最小值，确保最终速度不突破任意一层限制
+  double max_x_vel = std::abs(config_.target_x_vel);  // 取绝对值
+  max_x_vel = std::min(max_x_vel, vel_max_external_);  // 对比外部速度上限，取最小值
+  max_x_vel = std::min(max_x_vel, vel_max_obstacle_);  // 对比障碍物速度上限，取最小值
 
   // Apply mpc limit (last because less iterations required if max vel is already limited)
+  //
+  // 如果使用MPC，则计算MPC的最大速度
   double vel_max_mpc = std::numeric_limits<double>::infinity();
   if (config_.use_mpc) {
     vel_max_mpc = std::abs(
@@ -738,6 +738,7 @@ Controller::UpdateResult Controller::update_with_limits(
   }
 
   // The end velocity is bound by the same limits to avoid accelerating above the limit in the end phase
+  // 终点速度需与当前速度限制保持一致，防止减速阶段因加速度过大导致超限‌
   double max_end_x_vel = std::min(
     {std::abs(config_.target_end_x_vel), vel_max_external_, vel_max_obstacle_, vel_max_mpc});
   max_end_x_vel = std::copysign(max_end_x_vel, config_.target_end_x_vel);
@@ -749,87 +750,98 @@ Controller::UpdateResult Controller::update_with_limits(
 
 // output updated velocity command: (Current position, current measured velocity, closest point index, estimated
 // duration of arrival, debug info)
+// 实现了一个基于模型预测控制（MPC）的最大速度计算函数 
+// target_x_vel: 目标速度
+// current_tf: 当前变换
+// odom_twist: 当前里程计速度
 double Controller::mpc_based_max_vel(
   double target_x_vel, const tf2::Transform & current_tf, const geometry_msgs::Twist & odom_twist)
 {
-  // Temporary save global data
+  // 保存控制器状态，以便后续恢复
   ControllerState controller_state_saved;
   controller_state_saved = controller_state_;
 
-  // Bisection optimisation parameters
-  double target_x_vel_prev = 0.0;  // Previous iteration velocity command
-  int mpc_vel_optimization_iter = 0;
+  double target_x_vel_prev = 0.0;  // 前一次迭代的速度
+  int mpc_vel_optimization_iter = 0;  // 速度优化的迭代次数（二分法次数）
 
-  // MPC parameters
-  int mpc_fwd_iter = 0;  // Reset MPC iterations
+  // MPC预测参数：
+  int mpc_fwd_iter = 0;  // 前向模拟的迭代次数（MPC预测步数）
+  auto predicted_tf = current_tf;  // 预测的位姿
+  geometry_msgs::Twist pred_twist = odom_twist;  // 预测的速度
 
-  // Create predicted position vector
-  auto predicted_tf = current_tf;
-  geometry_msgs::Twist pred_twist = odom_twist;
+  double new_nominal_x_vel = target_x_vel;  // 新的目标速度
 
-  double new_nominal_x_vel = target_x_vel;  // Start off from the current velocity
-
-  // Loop MPC
+  // 循环条件为同时满足：
+  // 1. 前向模拟的迭代计数小于最大迭代次数（时间步长由config_.mpc_simulation_sample_time定义）
+  // 2. 速度优化的迭代计数小于速度优化的最大迭代次数（二分法次数）
   while (mpc_fwd_iter < config_.mpc_max_fwd_iterations &&
          mpc_vel_optimization_iter <= config_.mpc_max_vel_optimization_iterations) {
     mpc_fwd_iter += 1;
 
-    // Check if robot stays within bounds for all iterations, if the new_nominal_x_vel is smaller than
-    // max_target_x_vel we can increase it
+    // 检查是否在所有迭代都保持范围
+    // 如果 new_nominal_x_vel 小于 max_target_x_vel 我们可以加大
+
+    // 条件是否满足：
+    // 1. 前向模拟的迭代次数等于最大迭代次数
+    // 2. 横向误差小于最大横向误差
+    // 3. 新的目标速度小于目标速度
     if (
       mpc_fwd_iter == config_.mpc_max_fwd_iterations &&
       fabs(controller_state_.tracking_error_lat) <= config_.mpc_max_error_lat &&
       fabs(new_nominal_x_vel) < abs(target_x_vel)) {
-      mpc_vel_optimization_iter += 1;
+      mpc_vel_optimization_iter += 1;  // 速度优化的迭代计数+1
 
-      // When we reach the maximum allowed mpc optimization iterations, do not change velocity anymore
+      // 当达到最大允许的mpc速度优化迭代次数时，不再更改速度
       if (mpc_vel_optimization_iter > config_.mpc_max_vel_optimization_iterations) {
         break;
       }
 
-      // Increase speed
+      // std::exchange(val, new_val) 交换val和new_val的值，并返回val的旧值
+      // copysign(x, y) 返回x的绝对值和y的符号
+
+      // 加大速度，在安全范围内，总是尽可能接近目标速度，提高效率
       target_x_vel_prev = std::exchange(
         new_nominal_x_vel,
         copysign(1.0, new_nominal_x_vel) * abs(target_x_vel_prev - new_nominal_x_vel) / 2 +
           new_nominal_x_vel);
 
-      // Reset variables
-      controller_state_ = controller_state_saved;
-
-      predicted_tf = current_tf;
-      pred_twist = odom_twist;
-      mpc_fwd_iter = 0;
+      // 终止当前模拟，恢复参数
+      controller_state_ = controller_state_saved;  // 恢复控制器状态
+      predicted_tf = current_tf;  // 恢复预测位姿
+      pred_twist = odom_twist;  // 恢复预测速度
+      mpc_fwd_iter = 0;  // 重置前向模拟的迭代计数
     }
-    // If the robot gets out of bounds earlier we decrease the velocity
+    // 当横向误差超过阈值时，说明当前速度导致轨迹偏离过大，需要降低速度
     else if (abs(controller_state_.tracking_error_lat) >= config_.mpc_max_error_lat) {
       mpc_vel_optimization_iter += 1;
 
-      // Lower speed
+      // 通过二分法降低速度 new_nominal_x_vel
       target_x_vel_prev = std::exchange(
         new_nominal_x_vel,
         -copysign(1.0, new_nominal_x_vel) * abs(target_x_vel_prev - new_nominal_x_vel) / 2 +
           new_nominal_x_vel);
 
-      // Reset variables
-      controller_state_ = controller_state_saved;
+      // 终止当前模拟，恢复参数
+      controller_state_ = controller_state_saved;  // 恢复控制器状态
+      predicted_tf = current_tf;  // 恢复预测位姿
+      pred_twist = odom_twist;  // 恢复预测速度
+      mpc_fwd_iter = 0;  // 重置前向模拟的迭代计数
 
-      predicted_tf = current_tf;
-      pred_twist = odom_twist;
-      mpc_fwd_iter = 0;
-
-      // Warning if new_nominal_x_vel becomes really low
+      // 如果新的目标速度变得非常低，则发出警告
       if (abs(new_nominal_x_vel) < 0.01) {
+        // 降低速度并不能充分减小横向误差
         ROS_WARN_THROTTLE(5.0, "Lowering velocity did not decrease the lateral error enough.");
       }
-    } else if (mpc_fwd_iter != config_.mpc_max_fwd_iterations) {
-      // Run controller
-      // Output: pred_twist.[linear.x, linear.y, linear.z, angular.x, angular.y, angular.z]
+    }
+    // 正常前向模拟过程 （前向模拟的迭代次数小于最大迭代次数）
+    else if (mpc_fwd_iter != config_.mpc_max_fwd_iterations) {
+      // 调用控制器更新函数计算预测速度
       pred_twist = Controller::update(
                      new_nominal_x_vel, config_.target_end_x_vel, predicted_tf, pred_twist,
                      ros::Duration(config_.mpc_simulation_sample_time))
                      .velocity_command;
 
-      // Run plant model
+      // 通过预测速度计算预测位姿
       const double theta = tf2::getYaw(predicted_tf.getRotation());
       predicted_tf.getOrigin().setX(
         predicted_tf.getOrigin().getX() +
@@ -842,12 +854,12 @@ double Controller::mpc_based_max_vel(
       predicted_tf.setRotation(q);
     }
   }
-  // Apply limits to the velocity
+
+  // 速度限制，确保速度绝对值不低于 `mpc_min_x_vel`（避免停滞）
   double mpc_vel_limit =
     copysign(1.0, new_nominal_x_vel) * fmax(fabs(new_nominal_x_vel), config_.mpc_min_x_vel);
 
-  // Revert global variables
-  controller_state_ = controller_state_saved;
+  controller_state_ = controller_state_saved;  // 恢复控制器状态
 
   return std::abs(mpc_vel_limit);
 }

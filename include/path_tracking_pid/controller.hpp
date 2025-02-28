@@ -197,8 +197,8 @@ private:
     double previous_steering_yaw_vel = 0.0;
     bool end_phase_enabled = false;
     bool end_reached = false;
-    double tracking_error_lat = 0.0;
-    double tracking_error_ang = 0.0;
+    double tracking_error_lat = 0.0;  // 横向误差
+    double tracking_error_ang = 0.0;  // 航向误差
     // Errors with little history
     details::SecondOrderLowpass error_lat;
     details::SecondOrderLowpass error_ang;
