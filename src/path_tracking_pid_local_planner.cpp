@@ -214,7 +214,9 @@ std::optional<geometry_msgs::Twist> TrackingPidLocalPlanner::computeVelocityComm
   if (prev_time_.isZero()) {
     prev_time_ = now - prev_dt_;  // Initialisation round
   }
+  // 计算时间间隔
   ros::Duration dt = now - prev_time_;
+  // 判断时间间隔，避免无效计算
   if (dt.isZero()) {
     ROS_ERROR_THROTTLE(
       5, "dt=0 detected, skipping loop(s). Possible overloaded cpu or simulating too fast");
@@ -226,11 +228,13 @@ std::optional<geometry_msgs::Twist> TrackingPidLocalPlanner::computeVelocityComm
     // velocity is send instead.
     return cmd_vel;
   }
+  // 比如系统时间回退或者计算间隔过长的情况
   if (dt < ros::Duration(0) || dt > ros::Duration(DT_MAX)) {
     ROS_ERROR("Invalid time increment: %f. Aborting", dt.toSec());
     return std::nullopt;
   }
   try {
+    // 获取当前位姿
     ROS_DEBUG("map_frame: %s, base_link_frame: %s", map_frame_.c_str(), base_link_frame_.c_str());
     tfCurPoseStamped_ = tf_->lookupTransform(map_frame_, base_link_frame_, ros::Time(0));
   } catch (const tf2::TransformException & ex) {
@@ -240,14 +244,19 @@ std::optional<geometry_msgs::Twist> TrackingPidLocalPlanner::computeVelocityComm
   }
 
   // Handle obstacles
+  // 是否启动防碰撞
   if (pid_controller_.getConfig().anti_collision) {
+    // 获取机器人的footprint，并计算碰撞代价
     const std::vector<geometry_msgs::Point> footprint = costmap_->getRobotFootprint();
     auto cost = projectedCollisionCost(
       costmap_->getCostmap(), footprint, projectionSteps(), visualization_, map_frame_);
 
+    // 根据不同的代价调整最大速度限制，以避开障碍物
     if (cost >= costmap_2d::LETHAL_OBSTACLE) {
+      // 当cost超过致命障碍物时，速度被设置为零
       pid_controller_.setVelMaxObstacle(0.0);
     } else if (pid_controller_.getConfig().obstacle_speed_reduction) {
+      // 根据cost按比例降低速度
       double max_vel = pid_controller_.getConfig().max_x_vel;
       double reduction_factor = static_cast<double>(cost) / costmap_2d::LETHAL_OBSTACLE;
       double limit = max_vel * (1 - reduction_factor);
@@ -260,6 +269,7 @@ std::optional<geometry_msgs::Twist> TrackingPidLocalPlanner::computeVelocityComm
     pid_controller_.setVelMaxObstacle(INFINITY);  // Can be disabled live, so set back to inf
   }
 
+  // 结合限制条件计算速度
   const auto update_result = pid_controller_.update_with_limits(
     tf2_convert<tf2::Transform>(tfCurPoseStamped_.transform), latest_odom_.twist.twist, dt);
 
@@ -268,10 +278,13 @@ std::optional<geometry_msgs::Twist> TrackingPidLocalPlanner::computeVelocityComm
   feedback_msg.progress = update_result.progress;
   feedback_pub_.publish(feedback_msg);
 
+  // 如果请求取消
   if (cancel_requested_) {
+    // 重新配置PID控制器的参数
     path_tracking_pid::PidConfig config = pid_controller_.getConfig();
     // Copysign here, such that when cancelling while driving backwards, we decelerate to -0.0 and hence
     // the sign propagates correctly
+    // 设置目标速度为0
     config.target_x_vel = std::copysign(0.0, config.target_x_vel);
     config.target_end_x_vel = std::copysign(0.0, config.target_x_vel);
     boost::recursive_mutex::scoped_lock lock(config_mutex_);
@@ -282,6 +295,7 @@ std::optional<geometry_msgs::Twist> TrackingPidLocalPlanner::computeVelocityComm
     cancel_requested_ = false;
   }
 
+  // 如果启用了调试功能，会发布调试信息和rviz的可视化数据，比如当前位姿、控制点、目标点
   if (controller_debug_enabled_) {
     debug_pub_.publish(update_result.pid_debug);
 
@@ -479,16 +493,19 @@ uint32_t TrackingPidLocalPlanner::computeVelocityCommands(
   const geometry_msgs::PoseStamped & /* pose */, const geometry_msgs::TwistStamped & /* velocity */,
   geometry_msgs::TwistStamped & cmd_vel, std::string & /* message */)
 {
+  // 检查是否初始化
   if (!initialized_) {
     ROS_ERROR(
       "path_tracking_pid has not been initialized, please call initialize() before using this "
       "planner");
-    active_goal_ = false;
+    active_goal_ = false;  // 活动目标标志
     return mbf_msgs::ExePathResult::NOT_INITIALIZED;
   }
   // TODO(Cesar): Use provided pose and odom
+  // 计算速度
   const auto opt_cmd_vel = computeVelocityCommands();
   if (!opt_cmd_vel) {
+    // 速度计算失败
     active_goal_ = false;
     return mbf_msgs::ExePathResult::FAILURE;
   }
@@ -496,24 +513,30 @@ uint32_t TrackingPidLocalPlanner::computeVelocityCommands(
   cmd_vel.header.stamp = ros::Time::now();
   cmd_vel.header.frame_id = base_link_frame_;
 
+  // 根据速度值判断机器人是否在移动
   bool moving = std::abs(cmd_vel.twist.linear.x) > VELOCITY_EPS;
+  // 判断是否有取消请求
   if (cancel_in_progress_) {
     if (!moving) {
+      // 若请求取消且机器人没有运动，则返回已取消
       ROS_INFO(
         "Cancel requested and we now (almost) reached velocity 0: %f", cmd_vel.twist.linear.x);
       cancel_in_progress_ = false;
       active_goal_ = false;
       return mbf_msgs::ExePathResult::CANCELED;
     }
+    // 若请求取消但机器人还没停下来，则返回正在取消
     ROS_INFO_THROTTLE(1.0, "Cancel in progress... remaining x_vel: %f", cmd_vel.twist.linear.x);
     return to_underlying(ComputeVelocityCommandsResult::GRACEFULLY_CANCELLING);
   }
 
+  // 如果机器人静止且pid_controller_的最大障碍速度低于阈值，返回BLOCKED_PATH (可能是因为前方有障碍物导致无法移动)
   if (!moving && pid_controller_.getVelMaxObstacle() < VELOCITY_EPS) {
     active_goal_ = false;
     return mbf_msgs::ExePathResult::BLOCKED_PATH;
   }
 
+  // 检查是否到达目标
   if (isGoalReached()) {
     active_goal_ = false;
   }
