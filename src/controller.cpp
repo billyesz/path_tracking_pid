@@ -329,6 +329,12 @@ Controller::FindPoseOnPlanResult Controller::findPoseOnPlan(
   return {closest_pose_behind, global_plan_index, distance_to_goal, global_plan_index - 1};
 }
 
+// target_x_vel: 目标线速度
+// target_end_x_vel: 终点目标线速度
+// current_tf: 当前位姿
+// odom_twist: 里程计速度
+// dt: 时间间隔
+// 通过综合PID控制、前馈补偿和动态速度规划，实现了复杂路径的精确跟踪。其模块化设计便于扩展（如不同机器人模型），同时严格的限制条件确保安全性和鲁棒性
 Controller::UpdateResult Controller::update(
   double target_x_vel, double target_end_x_vel, const tf2::Transform & current_tf,
   const geometry_msgs::Twist & odom_twist, ros::Duration dt)
@@ -337,12 +343,14 @@ Controller::UpdateResult Controller::update(
 
   current_with_carrot_ = getControlPointPose(current_tf, config_.l);
 
+  // 根据 track_base_link，确认参考位姿
   const auto & reference_pose = config_.track_base_link ? current_tf : current_with_carrot_;
+  // 在全局路径中找到距离当前最近的路径点
   const auto find_result =
     findPoseOnPlan(reference_pose, controller_state_.current_global_plan_index);
+  // 确定当前目标位姿 current_goal_ 和进度信息
   const auto & path_pose_idx = find_result.path_pose_idx;
   const auto & distance_to_goal = find_result.distance_to_goal;
-
   current_pos_on_plan_ = current_goal_ = find_result.pose;
 
   if (config_.track_base_link) {
@@ -351,7 +359,7 @@ Controller::UpdateResult Controller::update(
 
   result.progress = 1.0 - distance_to_goal / distance_to_goal_vector_[0];
 
-  // Compute errorPose between controlPose and currentGoalPose
+  // 计算控制点与目标位姿之间的变换误差 error（使用逆变换）
   const auto error = current_with_carrot_.inverseTimes(current_goal_);
 
   //***** Feedback control *****//
@@ -368,6 +376,9 @@ Controller::UpdateResult Controller::update(
     ROS_WARN("All three gains (Kp, Ki, Kd) should have the same sign for stability.");
   }
 
+  // error.getOrigin().y()：横向误差
+  // tf2::getYaw(error.getRotation())：航向误差
+  // 对横向和角度误差应用低通滤波，平滑噪声
   auto error_lat_filtered = controller_state_.error_lat.filter(error.getOrigin().y(), dt.toSec());
   auto error_ang_filtered = controller_state_.error_ang.filter(
     angles::normalize_angle(tf2::getYaw(error.getRotation())), dt.toSec());
@@ -406,11 +417,11 @@ Controller::UpdateResult Controller::update(
   auto error_deriv_ang = controller_state_.error_deriv_ang.filter(error_ang_filtered, dt.toSec());
 
   // calculate the control effort
-  const auto proportional_lat = config_.Kp_lat * error_lat_filtered;
+  const auto proportional_lat = config_.Kp_lat * error_lat_filtered;  // 横向误差的比例控制
   const auto integral_lat = config_.Ki_lat * error_integral_lat;
   const auto derivative_lat = config_.Kd_lat * error_deriv_lat;
 
-  const auto proportional_ang = config_.Kp_ang * error_ang_filtered;
+  const auto proportional_ang = config_.Kp_ang * error_ang_filtered;  // 航向误差的比例控制
   const auto integral_ang = config_.Ki_ang * error_integral_ang;
   const auto derivative_ang = config_.Kd_ang * error_deriv_ang;
 
@@ -567,8 +578,8 @@ Controller::UpdateResult Controller::update(
   }
 
   // Apply saturation limits
-  control_effort_lat_ = std::clamp(control_effort_lat_, lat_lower_limit, lat_upper_limit);
-  control_effort_ang_ = std::clamp(control_effort_ang_, ang_lower_limit, ang_upper_limit);
+  control_effort_lat_ = std::clamp(control_effort_lat_, lat_lower_limit, lat_upper_limit);  // 合成P、I、D和前馈项，应用限幅
+  control_effort_ang_ = std::clamp(control_effort_ang_, ang_lower_limit, ang_upper_limit);  // 应用限幅
 
   // Populate debug output
   // Error topic containing the 'control' error on which the PID acts
@@ -638,6 +649,7 @@ Controller::UpdateResult Controller::update(
   result.velocity_command.angular.z = new_yaw_vel;
 
   // Transform velocity commands at base_link to steer when using tricycle model
+  // 三轮车模型处理
   if (use_tricycle_model_) {
     geometry_msgs::Twist output_steering;
     TricycleSteeringCmdVel steering_cmd =
@@ -696,6 +708,7 @@ Controller::UpdateResult Controller::update(
     controller_state_.error_integral_ang.reset();
   }
 
+  // 合成线速度和角速度，确保不超过最大限制
   controller_state_.current_x_vel = new_x_vel;
   controller_state_.current_yaw_vel = new_yaw_vel;
 
